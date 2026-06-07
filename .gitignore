@@ -1,0 +1,13 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.streamlit_uploads/
+output/
+chrome-profile/
+Job_Application_Agent_Project_Report.docx
+~$*.docx
+.DS_Store
+Thumbs.db
