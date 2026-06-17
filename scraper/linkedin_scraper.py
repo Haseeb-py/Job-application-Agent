@@ -11,6 +11,7 @@ from typing import Any
 from urllib.parse import parse_qs, quote_plus, urljoin, urlparse
 
 from dotenv import load_dotenv
+from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
@@ -19,6 +20,20 @@ from scraper.utils import clean_text, deduplicate_jobs, env_headless, get_driver
 
 load_dotenv()
 logger = logging.getLogger(__name__)
+
+
+def _describe_current_page(driver: Any) -> str:
+    """Return a short browser page description for diagnostics."""
+
+    try:
+        current_url = driver.current_url
+    except Exception:
+        current_url = "unknown"
+    try:
+        title = driver.title
+    except Exception:
+        title = "unknown"
+    return f"Current URL: {current_url}; title: {title}"
 
 
 def _canonical_linkedin_job_url(raw_url: str | None) -> str | None:
@@ -204,9 +219,18 @@ def _login(driver: Any, errors: list[str]) -> bool:
             errors.append("LinkedIn checkpoint or verification blocked automated login. Use HEADLESS=false and complete verification manually.")
             return False
         return True
+    except TimeoutException as exc:
+        logger.exception("LinkedIn login timed out")
+        errors.append(
+            "LinkedIn login timed out before the authenticated jobs page loaded. "
+            f"{_describe_current_page(driver)}. "
+            "On Streamlit Cloud, LinkedIn often blocks automated/headless login with verification or bot checks."
+        )
+        return False
     except Exception as exc:
         logger.exception("LinkedIn login failed")
-        errors.append(f"LinkedIn login failed: {exc}")
+        detail = str(exc).strip() or exc.__class__.__name__
+        errors.append(f"LinkedIn login failed: {detail}. {_describe_current_page(driver)}")
         return False
 
 
@@ -233,6 +257,10 @@ def scrape_linkedin_jobs(
     collected_errors = errors if errors is not None else []
     jobs: list[dict[str, Any]] = []
     driver = None
+    if os.getenv("LINKEDIN_ENABLED", "true").strip().lower() in {"0", "false", "no", "off"}:
+        logger.info("LinkedIn scraping skipped because LINKEDIN_ENABLED is false")
+        return jobs
+
     try:
         driver = get_driver(env_headless() if headless is None else headless)
         if not _login(driver, collected_errors):
