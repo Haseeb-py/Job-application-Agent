@@ -14,7 +14,7 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ex
 from agent.prompts import cover_letter_prompt
 from agent.state import AgentState
 from matcher.semantic_match import semantic_match
-from output.exporter import save_to_json
+from storage.exporter import save_to_json
 from resume.skill_gap import analyze_gap, extract_skills
 from scraper.glassdoor_scraper import scrape_glassdoor_jobs
 from scraper.linkedin_scraper import scrape_linkedin_jobs
