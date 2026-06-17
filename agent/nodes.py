@@ -51,7 +51,9 @@ def _call_groq(prompt_text: str) -> str:
         Generated cover letter text.
     """
 
-    llm = ChatGroq(model="llama3-8b-8192", temperature=0.3, api_key=os.getenv("GROQ_API_KEY"))
+    groq_api_key = (os.getenv("GROQ_API_KEY") or "").strip()
+    groq_model = (os.getenv("GROQ_MODEL") or "llama-3.1-8b-instant").strip()
+    llm = ChatGroq(model=groq_model, temperature=0.3, api_key=groq_api_key)
     response = llm.invoke(prompt_text)
     return str(response.content).strip()
 

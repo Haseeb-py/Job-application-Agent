@@ -10,6 +10,8 @@ import faiss
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
+from scraper.utils import deduplicate_jobs
+
 logger = logging.getLogger(__name__)
 
 MODEL_NAME = "all-MiniLM-L6-v2"
@@ -73,7 +75,7 @@ def semantic_match(
         logger.info("No job listings supplied for semantic matching")
         return []
 
-    searchable_jobs = [job for job in job_listings if str(job.get("description") or "").strip()]
+    searchable_jobs = deduplicate_jobs([job for job in job_listings if str(job.get("description") or "").strip()])
     if not searchable_jobs:
         logger.info("No job descriptions available for semantic matching")
         return []
@@ -103,4 +105,3 @@ def semantic_match(
             matches.append(job)
 
     return sorted(matches, key=lambda item: item.get("relevance_score", 0.0), reverse=True)[:top_k]
-

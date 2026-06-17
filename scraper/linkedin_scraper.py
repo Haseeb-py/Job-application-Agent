@@ -5,8 +5,10 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import logging
 import os
+import re
+import time
 from typing import Any
-from urllib.parse import quote_plus
+from urllib.parse import parse_qs, quote_plus, urljoin, urlparse
 
 from dotenv import load_dotenv
 from selenium.webdriver.common.by import By
@@ -17,6 +19,111 @@ from scraper.utils import clean_text, deduplicate_jobs, env_headless, get_driver
 
 load_dotenv()
 logger = logging.getLogger(__name__)
+
+
+def _canonical_linkedin_job_url(raw_url: str | None) -> str | None:
+    """Convert LinkedIn card/detail URLs into stable job view URLs."""
+
+    if not raw_url:
+        return None
+    absolute_url = urljoin("https://www.linkedin.com", raw_url)
+    parsed = urlparse(absolute_url)
+    path_match = re.search(r"/jobs/view/(?:.*?-)?(\d+)(?:/|$)", parsed.path)
+    if path_match:
+        return f"https://www.linkedin.com/jobs/view/{path_match.group(1)}/"
+
+    query = parse_qs(parsed.query)
+    current_job_id = query.get("currentJobId") or query.get("jobId")
+    if current_job_id and current_job_id[0]:
+        return f"https://www.linkedin.com/jobs/view/{current_job_id[0]}/"
+
+    return absolute_url.split("?")[0]
+
+
+def _clean_linkedin_location(text: str) -> str:
+    """Keep the actual LinkedIn location and drop card metadata."""
+
+    return re.split(r"·|Â·|Â|Ā|\||\b\d+\s+(?:minute|hour|day|week|month)s?\s+ago\b", clean_text(text), maxsplit=1)[0].strip()
+
+
+def _collect_search_jobs(driver: Any) -> list[dict[str, Any]]:
+    """Extract job records from the current LinkedIn search page."""
+
+    script = """
+        const cards = Array.from(document.querySelectorAll(
+            ".job-card-container, .jobs-search-results__list-item, [data-job-id], [data-occludable-job-id]"
+        ));
+        const text = (root, selectors) => {
+            for (const selector of selectors) {
+                const node = root.querySelector(selector);
+                if (node && node.innerText && node.innerText.trim()) return node.innerText.trim();
+            }
+            return "";
+        };
+        const attr = (root, selectors, name) => {
+            for (const selector of selectors) {
+                const node = root.querySelector(selector);
+                if (node && node.getAttribute(name)) return node.getAttribute(name);
+            }
+            return "";
+        };
+        return cards.map((card) => {
+            const href = attr(card, [
+                "a[href*='/jobs/view/']",
+                "a[href*='currentJobId=']",
+                "a.job-card-container__link",
+                "a.job-card-list__title--link"
+            ], "href");
+            const jobId = card.getAttribute("data-job-id") || card.getAttribute("data-occludable-job-id") || "";
+            const title = text(card, [
+                ".job-card-list__title",
+                ".job-card-container__link",
+                "a[href*='/jobs/view/']",
+                "strong"
+            ]);
+            const company = text(card, [
+                ".artdeco-entity-lockup__subtitle",
+                ".job-card-container__company-name",
+                ".job-card-container__primary-description",
+                "[class*='company']"
+            ]);
+            const location = text(card, [
+                ".artdeco-entity-lockup__caption",
+                ".job-card-container__metadata-item",
+                "[class*='location']"
+            ]);
+            const snippet = text(card, [
+                ".job-card-container__description",
+                ".job-card-list__insight",
+                ".job-card-container__metadata-wrapper"
+            ]);
+            return { href, jobId, title, company, location, snippet };
+        }).filter((item) => item.href || item.jobId || item.title);
+    """
+    raw_jobs = driver.execute_script(script) or []
+    jobs: list[dict[str, Any]] = []
+    for raw_job in raw_jobs:
+        href = str(raw_job.get("href") or "").strip()
+        job_id = str(raw_job.get("jobId") or "").strip()
+        url = _canonical_linkedin_job_url(href) if href else None
+        if not url and job_id:
+            url = f"https://www.linkedin.com/jobs/view/{job_id}/"
+        title = clean_text(str(raw_job.get("title") or ""))
+        company = clean_text(str(raw_job.get("company") or ""))
+        location_text = _clean_linkedin_location(str(raw_job.get("location") or ""))
+        snippet = clean_text(str(raw_job.get("snippet") or ""))
+        if not any((title, company, url)):
+            continue
+
+        job = _job_schema()
+        job["job_id"] = url.rstrip("/").split("/")[-1] if url else job_id or None
+        job["job_title"] = title
+        job["company"] = company
+        job["location"] = location_text
+        job["description"] = clean_text(" ".join(part for part in [title, company, location_text, snippet] if part))
+        job["url"] = url
+        jobs.append(job)
+    return deduplicate_jobs(jobs)
 
 
 def _job_schema() -> dict[str, Any]:
@@ -132,40 +239,31 @@ def scrape_linkedin_jobs(
             return jobs
 
         page_start = 0
-        while len(jobs) < max_results:
+        page_count = 0
+        max_pages = max(1, (max_results + 24) // 25 + 2)
+        seen_urls: set[str] = set()
+        while len(jobs) < max_results and page_count < max_pages:
+            page_count += 1
             search_url = (
                 "https://www.linkedin.com/jobs/search/"
                 f"?keywords={quote_plus(job_title)}&location={quote_plus(location)}&start={page_start}"
             )
             driver.get(search_url)
             WebDriverWait(driver, 20).until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, ".job-card-container, .jobs-search-results__list-item")))
-            cards = driver.find_elements(By.CSS_SELECTOR, ".job-card-container, .jobs-search-results__list-item")
-            if not cards:
+            for _ in range(3):
+                driver.execute_script("window.scrollBy(0, Math.floor(window.innerHeight * 0.8));")
+                time.sleep(0.5)
+            page_jobs = _collect_search_jobs(driver)
+            if not page_jobs:
                 break
-            for card in cards:
+            for job in page_jobs:
                 if len(jobs) >= max_results:
                     break
-                try:
-                    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", card)
-                    card.click()
-                    WebDriverWait(driver, 12).until(EC.presence_of_element_located((By.CSS_SELECTOR, ".jobs-unified-top-card__job-title, h1")))
-                    job = _job_schema()
-                    title_el = safe_find(driver, By.CSS_SELECTOR, ".jobs-unified-top-card__job-title, h1", 8)
-                    company_el = safe_find(driver, By.CSS_SELECTOR, ".jobs-unified-top-card__company-name, .job-details-jobs-unified-top-card__company-name", 8)
-                    location_el = safe_find(driver, By.CSS_SELECTOR, ".jobs-unified-top-card__bullet, .job-details-jobs-unified-top-card__primary-description-container span", 8)
-                    desc_el = safe_find(driver, By.CSS_SELECTOR, ".jobs-description__content, .jobs-box__html-content", 10)
-                    date_el = safe_find(driver, By.CSS_SELECTOR, "time, .jobs-unified-top-card__posted-date", 4)
-                    job["job_title"] = clean_text(title_el.text if title_el else "")
-                    job["company"] = clean_text(company_el.text if company_el else "")
-                    job["location"] = clean_text(location_el.text if location_el else "")
-                    job["description"] = clean_text(desc_el.text if desc_el else "")
-                    job["date_posted"] = clean_text(date_el.text if date_el else "")
-                    job["url"] = driver.current_url.split("?")[0]
-                    job["job_id"] = job["url"].rstrip("/").split("/")[-1] if job["url"] else None
-                    jobs.append(job)
-                except Exception as exc:
-                    logger.exception("Failed to scrape LinkedIn job card")
-                    collected_errors.append(f"LinkedIn job card failed: {exc}")
+                job_url = str(job.get("url") or "")
+                if job_url in seen_urls:
+                    continue
+                seen_urls.add(job_url)
+                jobs.append(job)
             page_start += 25
     except Exception as exc:
         logger.exception("LinkedIn scraping failed")

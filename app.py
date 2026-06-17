@@ -207,9 +207,11 @@ def main() -> None:
         progress = st.progress(0)
         with st.status("Running agent pipeline...", expanded=True) as status:
             try:
-                status.write("Parsing resume and starting job search.")
+                st.session_state.pop("agent_state", None)
+                status.write("Saving resume and preparing the agent.")
                 resume_path = _save_upload(uploaded_resume)
                 progress.progress(15)
+                status.write("Loading matcher model and scraping job search pages.")
                 from agent.graph import run_agent
 
                 state = run_agent(resume_path, job_title, location, candidate_name, max_results, threshold)

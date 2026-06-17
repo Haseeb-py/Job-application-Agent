@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
 import re
 import subprocess
+import time
 from typing import Any
 
 from dotenv import load_dotenv
-from selenium.common.exceptions import TimeoutException, WebDriverException
+from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.remote.webelement import WebElement
 from selenium.webdriver.support import expected_conditions as EC
@@ -30,11 +32,41 @@ def get_driver(headless: bool = True) -> Any:
         Configured Selenium-compatible Chrome driver.
     """
 
+    version_main = os.getenv("CHROME_VERSION_MAIN") or _detect_chrome_major_version()
+    last_error: Exception | None = None
+    for attempt in range(2):
+        options = _build_chrome_options(headless)
+        try:
+            if version_main:
+                driver = uc.Chrome(options=options, version_main=int(version_main))
+            else:
+                driver = uc.Chrome(options=options)
+            driver.set_page_load_timeout(45)
+            return driver
+        except Exception as exc:
+            last_error = exc
+            logger.exception("Failed to create Chrome driver on attempt %s", attempt + 1)
+            if attempt == 0 and _is_chromedriver_cache_collision(exc):
+                _remove_stale_undetected_chromedriver()
+                time.sleep(1)
+                continue
+            if attempt == 0 and _is_chrome_startup_race(exc):
+                time.sleep(2)
+                continue
+            break
+    raise RuntimeError(f"Unable to start Chrome driver: {last_error}") from last_error
+
+
+def _build_chrome_options(headless: bool) -> Any:
+    """Build Chrome options for each startup attempt."""
+
     options = uc.ChromeOptions()
     if headless:
         options.add_argument("--headless=new")
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_argument("--disable-gpu")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--remote-debugging-port=0")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=1440,1200")
@@ -42,17 +74,37 @@ def get_driver(headless: bool = True) -> Any:
     user_data_dir = os.getenv("CHROME_USER_DATA_DIR")
     if user_data_dir:
         options.add_argument(f"--user-data-dir={user_data_dir}")
-    version_main = os.getenv("CHROME_VERSION_MAIN") or _detect_chrome_major_version()
-    try:
-        if version_main:
-            driver = uc.Chrome(options=options, version_main=int(version_main))
-        else:
-            driver = uc.Chrome(options=options)
-        driver.set_page_load_timeout(45)
-        return driver
-    except WebDriverException as exc:
-        logger.exception("Failed to create Chrome driver")
-        raise RuntimeError(f"Unable to start Chrome driver: {exc}") from exc
+    return options
+
+
+def _is_chromedriver_cache_collision(exc: Exception) -> bool:
+    """Detect undetected-chromedriver's Windows cached executable rename race."""
+
+    return getattr(exc, "winerror", None) == 183 or "WinError 183" in str(exc)
+
+
+def _is_chrome_startup_race(exc: Exception) -> bool:
+    """Detect transient Chrome startup failures that often succeed on retry."""
+
+    message = str(exc).lower()
+    return "chrome not reachable" in message or "cannot connect to chrome" in message or "session not created" in message
+
+
+def _remove_stale_undetected_chromedriver() -> None:
+    """Remove stale undetected-chromedriver cache files that block Windows renames."""
+
+    cache_dir = Path(os.getenv("APPDATA", "")) / "undetected_chromedriver"
+    targets = [
+        cache_dir / "undetected_chromedriver.exe",
+        cache_dir / "undetected" / "chromedriver-win32" / "chromedriver.exe",
+    ]
+    for target in targets:
+        try:
+            if target.exists():
+                target.unlink()
+                logger.info("Removed stale undetected-chromedriver cache file: %s", target)
+        except Exception as exc:
+            logger.warning("Could not remove stale undetected-chromedriver cache file %s: %s", target, exc)
 
 
 def _detect_chrome_major_version() -> str | None:
@@ -125,8 +177,24 @@ def clean_text(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 
 
+def _dedupe_text(value: Any) -> str:
+    """Normalize text fields for duplicate comparisons."""
+
+    return re.sub(r"\W+", " ", str(value or "").casefold()).strip()
+
+
+def _job_content_key(job: dict[str, Any]) -> str:
+    """Create a fallback duplicate key from visible job content."""
+
+    title = _dedupe_text(job.get("job_title"))
+    company = _dedupe_text(job.get("company"))
+    location_text = re.split(r"·|Â·|Â|Ā|\||\b\d+\s+(?:minute|hour|day|week|month)s?\s+ago\b", str(job.get("location") or ""), maxsplit=1)[0]
+    location = _dedupe_text(location_text)
+    return f"{job.get('source')}::{title}::{company}::{location}"
+
+
 def deduplicate_jobs(jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Deduplicate jobs by URL while preserving order.
+    """Deduplicate jobs by stable job identity while preserving order.
 
     Args:
         jobs: Job dictionaries with a url field.
@@ -136,13 +204,20 @@ def deduplicate_jobs(jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
 
     seen: set[str] = set()
+    seen_content: set[str] = set()
     unique: list[dict[str, Any]] = []
     for job in jobs:
+        source = str(job.get("source") or "").strip().lower()
+        job_id = str(job.get("job_id") or "").strip()
         url = str(job.get("url") or "").strip()
-        key = url or f"{job.get('company')}::{job.get('job_title')}::{job.get('location')}"
-        if key in seen:
+        key = f"{source}::{job_id}" if job_id else url
+        if not key:
+            key = f"{job.get('company')}::{job.get('job_title')}::{job.get('location')}"
+        content_key = _job_content_key(job)
+        if key in seen or content_key in seen_content:
             continue
         seen.add(key)
+        seen_content.add(content_key)
         unique.append(job)
     return unique
 
