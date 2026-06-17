@@ -32,15 +32,18 @@ def get_driver(headless: bool = True) -> Any:
         Configured Selenium-compatible Chrome driver.
     """
 
-    version_main = os.getenv("CHROME_VERSION_MAIN") or _detect_chrome_major_version()
+    browser_path = os.getenv("CHROME_BINARY") or _detect_browser_executable_path()
+    version_main = os.getenv("CHROME_VERSION_MAIN") or _detect_chrome_major_version(browser_path)
     last_error: Exception | None = None
     for attempt in range(2):
-        options = _build_chrome_options(headless)
+        options = _build_chrome_options(headless, browser_path)
         try:
+            chrome_kwargs: dict[str, Any] = {"options": options}
             if version_main:
-                driver = uc.Chrome(options=options, version_main=int(version_main))
-            else:
-                driver = uc.Chrome(options=options)
+                chrome_kwargs["version_main"] = int(version_main)
+            if browser_path:
+                chrome_kwargs["browser_executable_path"] = browser_path
+            driver = uc.Chrome(**chrome_kwargs)
             driver.set_page_load_timeout(45)
             return driver
         except Exception as exc:
@@ -57,7 +60,7 @@ def get_driver(headless: bool = True) -> Any:
     raise RuntimeError(f"Unable to start Chrome driver: {last_error}") from last_error
 
 
-def _build_chrome_options(headless: bool) -> Any:
+def _build_chrome_options(headless: bool, browser_path: str | None = None) -> Any:
     """Build Chrome options for each startup attempt."""
 
     options = uc.ChromeOptions()
@@ -71,6 +74,8 @@ def _build_chrome_options(headless: bool) -> Any:
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=1440,1200")
     options.add_argument("--lang=en-US")
+    if browser_path:
+        options.binary_location = browser_path
     user_data_dir = os.getenv("CHROME_USER_DATA_DIR")
     if user_data_dir:
         options.add_argument(f"--user-data-dir={user_data_dir}")
@@ -107,8 +112,28 @@ def _remove_stale_undetected_chromedriver() -> None:
             logger.warning("Could not remove stale undetected-chromedriver cache file %s: %s", target, exc)
 
 
-def _detect_chrome_major_version() -> str | None:
-    """Detect installed Chrome or Edge major version on Windows.
+def _detect_browser_executable_path() -> str | None:
+    """Detect an installed Chrome/Chromium executable path."""
+
+    candidates = [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/snap/bin/chromium",
+    ]
+    for browser_path in candidates:
+        if os.path.exists(browser_path):
+            return browser_path
+    return None
+
+
+def _detect_chrome_major_version(browser_path: str | None = None) -> str | None:
+    """Detect installed Chrome, Chromium, or Edge major version.
 
     Args:
         None.
@@ -117,14 +142,19 @@ def _detect_chrome_major_version() -> str | None:
         Browser major version string when detected, otherwise None.
     """
 
-    candidates = [
+    candidates = [browser_path] if browser_path else [
         r"C:\Program Files\Google\Chrome\Application\chrome.exe",
         r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
         r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
         r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/snap/bin/chromium",
     ]
     for browser_path in candidates:
-        if not os.path.exists(browser_path):
+        if not browser_path or not os.path.exists(browser_path):
             continue
         try:
             completed = subprocess.run(
